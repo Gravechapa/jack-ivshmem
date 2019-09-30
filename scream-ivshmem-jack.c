@@ -211,6 +211,10 @@ _Noreturn void cleanup()
     {
         jack_client_close (client);
     }
+    if (audio_buffer)
+    {
+        free(audio_buffer);
+    }
     pthread_spin_destroy(&state_sync);
     exit(EXIT_SUCCESS);
 }
