@@ -315,7 +315,7 @@ int main(int argc, char*argv[])
         if (check)
         {
             pthread_spin_lock(&state_sync);
-            if (audio_buffer_size - offset >= header->chunk_size / ((current_sample_size / 8) * current_channels))
+            if (audio_buffer_size - offset * current_channels >= header->chunk_size / (current_sample_size / 8))
             {
                 switch (current_sample_size)
                 {
