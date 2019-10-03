@@ -39,8 +39,7 @@ static uint32_t audio_buffer_size = 0;
 static uint32_t offset = 0;
 static bool ready = false;
 
-static SRC_STATE *resampler = NULL;
-static float *resample_buffer = NULL;
+static bool stop = false;
 
 struct shmheader
 {
@@ -205,31 +204,14 @@ void jack_configure()
     }
 }
 
-_Noreturn void cleanup()
+void interrupt()
 {
-    if (client)
-    {
-        jack_client_close (client);
-    }
-    if (audio_buffer)
-    {
-        free(audio_buffer);
-    }
-    if (resample_buffer)
-    {
-        free(resample_buffer);
-    }
-    if (resampler)
-    {
-        src_delete(resampler);
-    }
-    pthread_mutex_destroy(&state_sync);
-    exit(EXIT_SUCCESS);
+    stop = true;
 }
 
 void jack_shutdown(void *arg)
 {
-    cleanup();
+    interrupt();
 }
 
 int main(int argc, char*argv[])
@@ -239,7 +221,7 @@ int main(int argc, char*argv[])
         show_usage(argv[0]);
     }
 
-    signal(SIGINT, &cleanup);
+    signal(SIGINT, &interrupt);
 
     jack_status_t status;
     client = jack_client_open("scream-ivshmem", JackNullOption, &status);
@@ -264,11 +246,13 @@ int main(int argc, char*argv[])
     unsigned char current_sample_size = 0;
     bool check = false;
 
+    SRC_STATE *resampler = NULL;
+    float *resample_buffer = NULL;
     double resample_ratio = 1.0;
     int resampler_type = SRC_SINC_BEST_QUALITY;
     bool enable_resampling = false;
 
-    while (true)
+    while (!stop)
     {
         if (header->magic != 0x11112014)
         {
@@ -432,4 +416,23 @@ int main(int argc, char*argv[])
             pthread_mutex_unlock(&state_sync);
         }
     }
+
+    if (client)
+    {
+        jack_client_close (client);
+    }
+    if (audio_buffer)
+    {
+        free(audio_buffer);
+    }
+    if (resample_buffer)
+    {
+        free(resample_buffer);
+    }
+    if (resampler)
+    {
+        src_delete(resampler);
+    }
+    pthread_mutex_destroy(&state_sync);
+    return 0;
 }
