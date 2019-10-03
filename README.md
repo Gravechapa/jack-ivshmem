@@ -21,6 +21,3 @@ Launch your VM, make sure to have read permission for the shared memory device a
 ```shell
 $ scream-ivshmem-jack /dev/shm/scream-ivshmem
 ```
-## TODO
-
-Implement resampling
