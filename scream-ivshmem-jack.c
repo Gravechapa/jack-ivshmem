@@ -54,11 +54,20 @@ struct shmheader
     uint16_t channel_map;
 };
 
-static void show_usage(const char *arg0)
+static _Noreturn void show_usage(const char *arg0)
 {
     fprintf(stderr, "\n");
-    fprintf(stderr, "Usage: %s <ivshmem device path>\n", arg0);
-    fprintf(stderr, "\n");
+    fprintf(stderr, "Usage: %s <ivshmem device path> [-r] [-q <resampling quality>] [-h]\n", arg0);
+    fprintf(stderr, "\n"
+    "   -r                      Allow resampling\n"
+    "   -q <resampling quality> Resampling quality possible values:\n"
+    "                                   0 - SINC_BEST_QUALITY [Default]\n"
+    "                                   1 - SINC_MEDIUM_QUALITY\n"
+    "                                   2 - SINC_FASTEST\n"
+    "                                   3 - ZERO_ORDER_HOLD\n"
+    "                                   4 - LINEAR\n"
+    "                                   http://www.mega-nerd.com/SRC/api_misc.html#Converters\n"
+    "   -h                      Show this help message\n");
     exit(1);
 }
 
@@ -216,12 +225,47 @@ void jack_shutdown(void *arg)
 
 int main(int argc, char*argv[])
 {
-    if (argc != 2)
+    if (argc < 2)
     {
         show_usage(argv[0]);
     }
 
     signal(SIGINT, &interrupt);
+
+    SRC_STATE *resampler = NULL;
+    float *resample_buffer = NULL;
+    double resample_ratio = 1.0;
+    int resampler_type = SRC_SINC_BEST_QUALITY;
+    bool enable_resampling = false;
+
+    bool allow_resampling = false;
+    int c;
+    while ((c = getopt(argc, argv, "hrq:")) != -1)
+    {
+        switch (c)
+        {
+            case 'r':
+                allow_resampling = true;
+                break;
+            case 'q':
+            {
+                int q = atoi(optarg);
+                if (q >= 0 && q <= 4)
+                {
+                    resampler_type = q;
+                }
+                else
+                {
+                    show_usage(argv[0]);
+                }
+                break;
+            }
+            case 'h':
+            default:
+                show_usage(argv[0]);
+                break;
+        }
+    }
 
     jack_status_t status;
     client = jack_client_open("scream-ivshmem", JackNullOption, &status);
@@ -238,19 +282,13 @@ int main(int argc, char*argv[])
 
     jack_configure();
 
-    unsigned char * mmap = open_mmap(argv[1]);
+    unsigned char * mmap = open_mmap(argv[argc - 1]);
     struct shmheader *header = (struct shmheader*)mmap;
     uint16_t read_idx = header->write_idx;
 
     unsigned char current_sample_rate = 0;
     unsigned char current_sample_size = 0;
     bool check = false;
-
-    SRC_STATE *resampler = NULL;
-    float *resample_buffer = NULL;
-    double resample_ratio = 1.0;
-    int resampler_type = SRC_SINC_BEST_QUALITY;
-    bool enable_resampling = false;
 
     while (!stop)
     {
@@ -279,6 +317,11 @@ int main(int argc, char*argv[])
          || current_channels != header->channels
          || current_channel_map != header->channel_map)
         {
+            pthread_mutex_lock(&state_sync);
+            offset = 0;
+            ready = false;
+            pthread_mutex_unlock(&state_sync);
+
             current_sample_rate = header->sample_rate;
             current_sample_size = header->sample_size;
             current_channels = header->channels;
@@ -297,35 +340,43 @@ int main(int argc, char*argv[])
 
             if (rate != jack_sample_rate)
             {
-                int error;
-                resampler = src_new(resampler_type, current_channels, &error);
-                if (!resampler)
+                if (allow_resampling)
                 {
-                    fprintf(stderr, "%s", src_strerror(error));
-                    exit(EXIT_FAILURE);
+                    int error;
+                    resampler = src_new(resampler_type, current_channels, &error);
+                    if (!resampler)
+                    {
+                        fprintf(stderr, "%s", src_strerror(error));
+                        exit(EXIT_FAILURE);
+                    }
+                    resample_buffer = malloc(samples * current_channels * sizeof(float));
+                    enable_resampling = true;
                 }
-                resample_buffer = malloc(samples * current_channels * sizeof(float));
-                enable_resampling = true;
+                else
+                {
+                    printf("Incompatible sample rate %u (jack sample rate %u),"
+                           " not playing until next format switch.\n", rate, jack_sample_rate);
+                    check = false;
+                    continue;
+                }
             }
             else
             {
-                if (resample_buffer)
+                if (allow_resampling)
                 {
-                    free(resample_buffer);
-                    resample_buffer = NULL;
+                    if (resample_buffer)
+                    {
+                        free(resample_buffer);
+                        resample_buffer = NULL;
+                    }
+                    if (resampler)
+                    {
+                        src_delete(resampler);
+                        resampler = NULL;
+                    }
+                    enable_resampling = false;
                 }
-                if (resampler)
-                {
-                    src_delete(resampler);
-                    resampler = NULL;
-                }
-                enable_resampling = false;
             }
-
-            pthread_mutex_lock(&state_sync);
-            offset = 0;
-            ready = false;
-            pthread_mutex_unlock(&state_sync);
 
             audio_buffer_size = jack_buffer_size > (uint32_t)ceil(samples * resample_ratio) ?
                         jack_buffer_size * 3 : (uint32_t)ceil(samples * resample_ratio) * 3;
