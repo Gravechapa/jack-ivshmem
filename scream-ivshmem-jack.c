@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <stdalign.h>
 #include <signal.h>
+#include <math.h>
 
 #include <fcntl.h>
 
@@ -29,17 +30,16 @@ static jack_port_t *output_ports[11];
 static jack_nframes_t jack_sample_rate;
 static jack_nframes_t jack_buffer_size;
 
-static unsigned char current_sample_rate = 0;
-static unsigned char current_sample_size = 0;
 static unsigned char current_channels = 2;
 static uint16_t current_channel_map = 0x0003;
 
-static pthread_spinlock_t state_sync;
+static pthread_mutex_t state_sync = PTHREAD_MUTEX_INITIALIZER;
 static jack_default_audio_sample_t *audio_buffer = NULL;
 static uint32_t audio_buffer_size = 0;
 static uint32_t offset = 0;
 static bool ready = false;
 
+static bool stop = false;
 
 struct shmheader
 {
@@ -54,11 +54,20 @@ struct shmheader
     uint16_t channel_map;
 };
 
-static void show_usage(const char *arg0)
+static _Noreturn void show_usage(const char *arg0)
 {
     fprintf(stderr, "\n");
-    fprintf(stderr, "Usage: %s <ivshmem device path>\n", arg0);
-    fprintf(stderr, "\n");
+    fprintf(stderr, "Usage: %s <ivshmem device path> [-r] [-q <resampling quality>] [-h]\n", arg0);
+    fprintf(stderr, "\n"
+    "   -r                      Allow resampling\n"
+    "   -q <resampling quality> Resampling quality possible values:\n"
+    "                                   0 - SINC_BEST_QUALITY [Default]\n"
+    "                                   1 - SINC_MEDIUM_QUALITY\n"
+    "                                   2 - SINC_FASTEST\n"
+    "                                   3 - ZERO_ORDER_HOLD\n"
+    "                                   4 - LINEAR\n"
+    "                                   http://www.mega-nerd.com/SRC/api_misc.html#Converters\n"
+    "   -h                      Show this help message\n");
     exit(1);
 }
 
@@ -91,7 +100,7 @@ static void * open_mmap(const char *shmfile)
 
 int process(jack_nframes_t nframes, void *arg)
 {
-    pthread_spin_lock(&state_sync);
+    pthread_mutex_lock(&state_sync);
     if (ready)
     {
         JSList *output_buffers = NULL;
@@ -130,21 +139,28 @@ int process(jack_nframes_t nframes, void *arg)
         jack_slist_free(output_buffers);
         memmove(audio_buffer,
                 &audio_buffer[nframes * current_channels],
-                (audio_buffer_size - nframes * current_channels) * sizeof(jack_default_audio_sample_t));
+                (audio_buffer_size - nframes) * current_channels * sizeof(jack_default_audio_sample_t));
         offset -= nframes;
         if (offset < jack_buffer_size)
         {
             ready = false;
         }
+        pthread_mutex_unlock(&state_sync);
+        return 0;
     }
-    pthread_spin_unlock(&state_sync);
+    pthread_mutex_unlock(&state_sync);
 
+    for (int i = 0; i < 11; ++i)
+    {
+        jack_default_audio_sample_t *out = jack_port_get_buffer(output_ports[i], nframes);
+        memset(out, 0, nframes * sizeof(jack_default_audio_sample_t));
+    }
     return 0;
 }
 
 void jack_shutdown(void *arg);
 
-bool jack_configure()
+void jack_configure()
 {
     jack_set_process_callback(client, process, NULL);
     jack_on_shutdown(client, jack_shutdown, NULL);
@@ -200,38 +216,63 @@ bool jack_configure()
     if (jack_activate(client))
     {
         fprintf(stderr, "Cannot activate JACK client\n");
-        return false;
+        exit(EXIT_FAILURE);
     }
-    return true;
 }
 
-_Noreturn void cleanup()
+void interrupt()
 {
-    if (client)
-    {
-        jack_client_close (client);
-    }
-    if (audio_buffer)
-    {
-        free(audio_buffer);
-    }
-    pthread_spin_destroy(&state_sync);
-    exit(EXIT_SUCCESS);
+    stop = true;
 }
 
 void jack_shutdown(void *arg)
 {
-    cleanup();
+    interrupt();
 }
 
 int main(int argc, char*argv[])
 {
-    if (argc != 2)
+    if (argc < 2)
     {
         show_usage(argv[0]);
     }
 
-    signal(SIGINT, &cleanup);
+    signal(SIGINT, &interrupt);
+
+    SRC_STATE *resampler = NULL;
+    float *resample_buffer = NULL;
+    double resample_ratio = 1.0;
+    int resampler_type = SRC_SINC_BEST_QUALITY;
+    bool enable_resampling = false;
+
+    bool allow_resampling = false;
+    int c;
+    while ((c = getopt(argc, argv, "hrq:")) != -1)
+    {
+        switch (c)
+        {
+            case 'r':
+                allow_resampling = true;
+                break;
+            case 'q':
+            {
+                int q = atoi(optarg);
+                if (q >= 0 && q <= 4)
+                {
+                    resampler_type = q;
+                }
+                else
+                {
+                    show_usage(argv[0]);
+                }
+                break;
+            }
+            case 'h':
+            default:
+                show_usage(argv[0]);
+                break;
+        }
+    }
 
     jack_status_t status;
     client = jack_client_open("scream-ivshmem", JackNullOption, &status);
@@ -246,20 +287,17 @@ int main(int argc, char*argv[])
         exit(EXIT_FAILURE);
     }
 
-    pthread_spin_init(&state_sync, 0);
+    jack_configure();
 
-    if (!jack_configure())
-    {
-        exit(EXIT_FAILURE);
-    }
-
-    unsigned char * mmap = open_mmap(argv[1]);
+    unsigned char * mmap = open_mmap(argv[argc - 1]);
     struct shmheader *header = (struct shmheader*)mmap;
     uint16_t read_idx = header->write_idx;
 
+    unsigned char current_sample_rate = 0;
+    unsigned char current_sample_size = 0;
     bool check = false;
 
-    while (true)
+    while (!stop)
     {
         if (header->magic != 0x11112014)
         {
@@ -278,68 +316,181 @@ int main(int argc, char*argv[])
         {
             read_idx = 0;
         }
-        unsigned char *buffer = &mmap[header->offset+header->chunk_size*read_idx];
+        unsigned char *buffer = &mmap[header->offset + header->chunk_size * read_idx];
+        uint32_t samples = header->chunk_size / ((header->sample_size / 8) * header->channels);
 
         if (current_sample_rate != header->sample_rate
          || current_sample_size != header->sample_size
          || current_channels != header->channels
          || current_channel_map != header->channel_map)
         {
+            pthread_mutex_lock(&state_sync);
+            offset = 0;
+            ready = false;
+            pthread_mutex_unlock(&state_sync);
+
             current_sample_rate = header->sample_rate;
             current_sample_size = header->sample_size;
             current_channels = header->channels;
             current_channel_map = header->channel_map;
 
             uint32_t rate = ((current_sample_rate >= 128) ? 44100 : 48000) * (current_sample_rate % 128);
-            if (rate != jack_sample_rate
-               || (current_sample_size != 32 && current_sample_size != 16))
+            resample_ratio = (double)jack_sample_rate / (double)rate;
+
+            if (current_sample_size != 32 && current_sample_size != 24 && current_sample_size != 16)
             {
-                printf("Incompatible sample rate %u, sample size %hhu,"
-                       " not playing until next format switch.\n", rate, current_sample_size);
+                printf("Incompatible sample size %hhu,"
+                       " not playing until next format switch.\n", current_sample_size);
                 check = false;
                 continue;
             }
 
-            pthread_spin_lock(&state_sync);
-            offset = 0;
-            ready = false;
-            pthread_spin_unlock(&state_sync);
+            if (rate != jack_sample_rate)
+            {
+                if (allow_resampling)
+                {
+                    int error;
+                    resampler = src_new(resampler_type, current_channels, &error);
+                    if (!resampler)
+                    {
+                        fprintf(stderr, "%s", src_strerror(error));
+                        exit(EXIT_FAILURE);
+                    }
+                    resample_buffer = malloc(samples * current_channels * sizeof(float));
+                    enable_resampling = true;
+                }
+                else
+                {
+                    printf("Incompatible sample rate %u (jack sample rate %u),"
+                           " not playing until next format switch.\n", rate, jack_sample_rate);
+                    check = false;
+                    continue;
+                }
+            }
+            else
+            {
+                if (allow_resampling)
+                {
+                    if (resample_buffer)
+                    {
+                        free(resample_buffer);
+                        resample_buffer = NULL;
+                    }
+                    if (resampler)
+                    {
+                        src_delete(resampler);
+                        resampler = NULL;
+                    }
+                    enable_resampling = false;
+                }
+            }
 
-            uint32_t samples = header->chunk_size / ((current_sample_size / 8) * current_channels);
-            audio_buffer_size = jack_buffer_size > samples ? jack_buffer_size : samples ;
-            audio_buffer_size *= current_channels * 3;
-            audio_buffer = realloc(audio_buffer, audio_buffer_size * sizeof(jack_default_audio_sample_t));
+            audio_buffer_size = jack_buffer_size > (uint32_t)ceil(samples * resample_ratio) ?
+                        jack_buffer_size * 3 : (uint32_t)ceil(samples * resample_ratio) * 3;
+            audio_buffer = realloc(audio_buffer, audio_buffer_size * current_channels * sizeof(jack_default_audio_sample_t));
             check = true;
         }
 
         if (check)
         {
-            pthread_spin_lock(&state_sync);
-            if (audio_buffer_size - offset * current_channels >= header->chunk_size / (current_sample_size / 8))
+            pthread_mutex_lock(&state_sync);
+            if (audio_buffer_size - offset >= (uint32_t)ceil(samples * resample_ratio))
             {
+                float *output_buffer;
+                if (enable_resampling)
+                {
+                    output_buffer = resample_buffer;
+                }
+                else
+                {
+                    output_buffer = audio_buffer + offset * current_channels;
+                }
+
                 switch (current_sample_size)
                 {
                     case 16:
                         src_short_to_float_array((int16_t*)buffer,
-                                                  audio_buffer + offset * current_channels,
-                                                  header->chunk_size / (current_sample_size / 8));
+                                                  output_buffer,
+                                                  samples * current_channels);
                         break;
+                    case 24:
+                    {
+                        int size = samples * current_channels;
+                        while (size)
+                        {
+                            --size;
+                            int32_t tmp;
+                            tmp = buffer[size * 3] | buffer[size * 3 + 1] << 8 | buffer[size * 3 + 2] << 16;
+                            if ((tmp >> 16) & 0x80)
+                            {
+                                tmp |= 0xff << 24;
+                            }
+                            output_buffer[size] = (float)(tmp / (1.0 * 0x800000));
+                        }
+                        break;
+                    }
                     case 32:
                         src_int_to_float_array((int32_t*)buffer,
-                                                audio_buffer + offset * current_channels,
-                                                header->chunk_size / (current_sample_size / 8));
+                                                output_buffer,
+                                                samples * current_channels);
                         break;
                     default:
                         continue;
                 }
 
-                offset += header->chunk_size / ((current_sample_size / 8) * current_channels);
+                if (enable_resampling)
+                {
+                    SRC_DATA data;
+                    data.data_in = resample_buffer;
+                    data.data_out = audio_buffer + offset * current_channels;
+                    data.input_frames = samples;
+                    data.output_frames = audio_buffer_size - offset;
+                    data.end_of_input = 0;
+                    data.src_ratio = resample_ratio;
+
+                    int error;
+                    error = src_process(resampler, &data);
+                    if (error)
+                    {
+                        fprintf(stderr, "%s", src_strerror(error));
+                        exit(EXIT_FAILURE);
+                    }
+                    if (samples != data.input_frames_used)
+                    {
+                        printf("Warning: not all frames been used during resampling");
+                    }
+                    offset += data.output_frames_gen;
+                }
+                else
+                {
+                    offset += samples;
+                }
+
                 if (offset >= jack_buffer_size)
                 {
                     ready = true;
                 }
             }
-            pthread_spin_unlock(&state_sync);
+            pthread_mutex_unlock(&state_sync);
         }
     }
+
+    if (client)
+    {
+        jack_client_close (client);
+    }
+    if (audio_buffer)
+    {
+        free(audio_buffer);
+    }
+    if (resample_buffer)
+    {
+        free(resample_buffer);
+    }
+    if (resampler)
+    {
+        src_delete(resampler);
+    }
+    pthread_mutex_destroy(&state_sync);
+    return 0;
 }
