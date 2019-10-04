@@ -145,9 +145,16 @@ int process(jack_nframes_t nframes, void *arg)
         {
             ready = false;
         }
+        pthread_mutex_unlock(&state_sync);
+        return 0;
     }
     pthread_mutex_unlock(&state_sync);
 
+    for (int i = 0; i < 11; ++i)
+    {
+        jack_default_audio_sample_t *out = jack_port_get_buffer(output_ports[i], nframes);
+        memset(out, 0, nframes * sizeof(jack_default_audio_sample_t));
+    }
     return 0;
 }
 
