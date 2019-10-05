@@ -345,6 +345,10 @@ int main(int argc, char*argv[])
                 continue;
             }
 
+            if (enable_resampling)
+            {
+                src_delete(resampler);
+            }
             if (rate != jack_sample_rate)
             {
                 if (allow_resampling)
@@ -356,7 +360,7 @@ int main(int argc, char*argv[])
                         fprintf(stderr, "%s", src_strerror(error));
                         exit(EXIT_FAILURE);
                     }
-                    resample_buffer = malloc(samples * current_channels * sizeof(float));
+                    resample_buffer = realloc(resample_buffer, samples * current_channels * sizeof(float));
                     enable_resampling = true;
                 }
                 else
@@ -369,18 +373,10 @@ int main(int argc, char*argv[])
             }
             else
             {
-                if (allow_resampling)
+                if (enable_resampling)
                 {
-                    if (resample_buffer)
-                    {
-                        free(resample_buffer);
-                        resample_buffer = NULL;
-                    }
-                    if (resampler)
-                    {
-                        src_delete(resampler);
-                        resampler = NULL;
-                    }
+                    free(resample_buffer);
+                    resample_buffer = NULL;
                     enable_resampling = false;
                 }
             }
@@ -477,20 +473,18 @@ int main(int argc, char*argv[])
 
     if (client)
     {
-        jack_client_close (client);
+        jack_client_close(client);
     }
     if (audio_buffer)
     {
         free(audio_buffer);
     }
-    if (resample_buffer)
-    {
-        free(resample_buffer);
-    }
-    if (resampler)
+    if (enable_resampling)
     {
         src_delete(resampler);
+        free(resample_buffer);
     }
     pthread_mutex_destroy(&state_sync);
+
     return 0;
 }
