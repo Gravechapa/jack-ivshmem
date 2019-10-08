@@ -98,7 +98,7 @@ static void * open_mmap(const char *shmfile)
     return map;
 }
 
-int process(jack_nframes_t nframes, void *arg)
+int process(jack_nframes_t nframes, __attribute__((unused)) void *arg)
 {
     pthread_mutex_lock(&state_sync);
     if (ready)
@@ -150,6 +150,7 @@ int process(jack_nframes_t nframes, void *arg)
     }
     pthread_mutex_unlock(&state_sync);
 
+    //To avoid crackling sound on format change
     for (int i = 0; i < 11; ++i)
     {
         jack_default_audio_sample_t *out = jack_port_get_buffer(output_ports[i], nframes);
@@ -208,7 +209,7 @@ void jack_configure()
     {
         if (!output_ports[i])
         {
-            printf( "JACK cannot register port");
+            fprintf(stderr, "JACK cannot register port\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -225,7 +226,7 @@ void interrupt()
     stop = true;
 }
 
-void jack_shutdown(void *arg)
+void jack_shutdown(__attribute__((unused)) void *arg)
 {
     interrupt();
 }
@@ -238,6 +239,7 @@ int main(int argc, char*argv[])
     }
 
     signal(SIGINT, &interrupt);
+    signal(SIGTERM, &interrupt);
 
     SRC_STATE *resampler = NULL;
     float *resample_buffer = NULL;
@@ -270,7 +272,6 @@ int main(int argc, char*argv[])
             case 'h':
             default:
                 show_usage(argv[0]);
-                break;
         }
     }
 
@@ -361,6 +362,11 @@ int main(int argc, char*argv[])
                         exit(EXIT_FAILURE);
                     }
                     resample_buffer = realloc(resample_buffer, samples * current_channels * sizeof(float));
+                    if (!resample_buffer)
+                    {
+                        fprintf(stderr, "Out of memory: can't allocate the resample buffer\n");
+                        exit(EXIT_FAILURE);
+                    }
                     enable_resampling = true;
                 }
                 else
@@ -384,6 +390,11 @@ int main(int argc, char*argv[])
             audio_buffer_size = jack_buffer_size > (uint32_t)ceil(samples * resample_ratio) ?
                         jack_buffer_size * 3 : (uint32_t)ceil(samples * resample_ratio) * 3;
             audio_buffer = realloc(audio_buffer, audio_buffer_size * current_channels * sizeof(jack_default_audio_sample_t));
+            if (!audio_buffer)
+            {
+                fprintf(stderr, "Out of memory: can't allocate the audio buffer\n");
+                exit(EXIT_FAILURE);
+            }
             check = true;
         }
 
@@ -448,12 +459,12 @@ int main(int argc, char*argv[])
                     error = src_process(resampler, &data);
                     if (error)
                     {
-                        fprintf(stderr, "%s", src_strerror(error));
+                        fprintf(stderr, "%s\n", src_strerror(error));
                         exit(EXIT_FAILURE);
                     }
                     if (samples != data.input_frames_used)
                     {
-                        printf("Warning: not all frames been used during resampling");
+                        printf("Warning: not all frames been used during resampling\n");
                     }
                     offset += data.output_frames_gen;
                 }
@@ -466,6 +477,10 @@ int main(int argc, char*argv[])
                 {
                     ready = true;
                 }
+            }
+            else
+            {
+                printf("Warning: audio buffer is full\n");
             }
             pthread_mutex_unlock(&state_sync);
         }
